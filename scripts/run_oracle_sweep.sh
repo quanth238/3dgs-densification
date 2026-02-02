@@ -6,20 +6,35 @@ set -euo pipefail
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
+# Dataset roots (edit if needed)
+DATASET_ROOT_MIPNERF360="/home/tri-dev/dev/namn_workspace/dataset/mipnerf360"
+DATASET_ROOT_TNT="/home/tri-dev/dev/namn_workspace/dataset/tanks_and_temples"
+
+# Scenes to run (edit to match what you have)
+# MIPNERF360_SCENES=(bonsai bicycle counter garden kitchen room stump)
+MIPNERF360_SCENES=(bonsai room)
+TNT_SCENES=(train truck)
+
 # Format: "name:dataset_path:model_path"
-DATASETS=(
-  "bonsai:/home/tri-dev/dev/namn_workspace/dataset/mipnerf360/bonsai:./experiment/bonsai"
-  # "bicycle:/home/tri-dev/dev/namn_workspace/dataset/mipnerf360/bicycle:./experiment/bicycle"
-  # "room:/home/tri-dev/dev/namn_workspace/dataset/mipnerf360/room:./experiment/room"
-)
+DATASETS=()
+for scene in "${MIPNERF360_SCENES[@]}"; do
+  DATASETS+=("${scene}:${DATASET_ROOT_MIPNERF360}/${scene}:./experiment/${scene}")
+done
+for scene in "${TNT_SCENES[@]}"; do
+  DATASETS+=("tnt_${scene}:${DATASET_ROOT_TNT}/${scene}:./experiment/tnt_${scene}")
+done
 
 # Iterations to test. Leave empty to use latest (-1).
 ITERATIONS=(1000 3000 7000)
 
 AUTO_TRAIN=1
 # Extra args for training (e.g., -r 4)
-DEFAULT_IMAGES="images_4"
-TRAIN_EXTRA_ARGS=("--images" "${DEFAULT_IMAGES}" "-r" "4" "--disable_viewer" "--quiet")
+DEFAULT_IMAGES_MIP="images_4"
+DEFAULT_IMAGES_TNT="images"
+TRAIN_EXTRA_ARGS_MIP=("--images" "${DEFAULT_IMAGES_MIP}" "-r" "4" "--disable_viewer" "--quiet")
+TRAIN_EXTRA_ARGS_TNT=("--images" "${DEFAULT_IMAGES_TNT}" "--disable_viewer" "--quiet")
+CURRENT_IMAGES="${DEFAULT_IMAGES_MIP}"
+CURRENT_TRAIN_ARGS=("${TRAIN_EXTRA_ARGS_MIP[@]}")
 
 EPS_LIST="1e-3,2e-3,5e-3"
 NUM_SAMPLES=300
@@ -32,6 +47,9 @@ CENTRAL_DIFF=1
 ALPHA_MIN=0.05
 ALPHA_MAX=0.95
 TOPK=20
+CROSS_OUT_DIR="./experiment/oracle_verify"
+
+SUMMARY_LIST_FILE=""
 
 list_available_iters() {
   local pc_dir="$1"
@@ -67,7 +85,7 @@ train_if_missing() {
     --model_path "${model_path}" \
     --iterations "${max_iter}" \
     --save_iterations "${missing_iters[@]}" \
-    "${TRAIN_EXTRA_ARGS[@]}"
+    "${CURRENT_TRAIN_ARGS[@]}"
 }
 
 run_verify() {
@@ -81,7 +99,7 @@ run_verify() {
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" python verify_oracle.py \
     --source_path "${dataset_path}" \
     --model_path "${model_path}" \
-    --images "${DEFAULT_IMAGES}" \
+    --images "${CURRENT_IMAGES}" \
     --iteration "${iter}" \
     --num_samples "${NUM_SAMPLES}" \
     --eps_list "${EPS_LIST}" \
@@ -92,7 +110,14 @@ run_verify() {
     --alpha_min "${ALPHA_MIN}" --alpha_max "${ALPHA_MAX}" \
     --topk "${TOPK}" \
     --out_dir "${out_dir}"
+
+  if [[ -f "${out_dir}/sweep_summary.csv" ]]; then
+    echo "${out_dir}/sweep_summary.csv" >> "${SUMMARY_LIST_FILE}"
+  fi
 }
+
+mkdir -p "${CROSS_OUT_DIR}"
+SUMMARY_LIST_FILE="$(mktemp)"
 
 for entry in "${DATASETS[@]}"; do
   IFS=":" read -r name dataset_path model_path <<< "${entry}"
@@ -102,8 +127,21 @@ for entry in "${DATASETS[@]}"; do
     continue
   fi
   if [[ ! -d "${model_path}" ]]; then
-    echo "Skip ${name}: model path not found: ${model_path}"
-    continue
+    if [[ "${AUTO_TRAIN}" == "1" ]]; then
+      echo "Warn ${name}: model path not found, creating: ${model_path}"
+      mkdir -p "${model_path}"
+    else
+      echo "Skip ${name}: model path not found: ${model_path}"
+      continue
+    fi
+  fi
+
+  if [[ "${name}" == tnt_* ]]; then
+    CURRENT_IMAGES="${DEFAULT_IMAGES_TNT}"
+    CURRENT_TRAIN_ARGS=("${TRAIN_EXTRA_ARGS_TNT[@]}")
+  else
+    CURRENT_IMAGES="${DEFAULT_IMAGES_MIP}"
+    CURRENT_TRAIN_ARGS=("${TRAIN_EXTRA_ARGS_MIP[@]}")
   fi
 
   pc_dir="${model_path}/point_cloud"
@@ -151,3 +189,15 @@ for entry in "${DATASETS[@]}"; do
     fi
   done
 done
+
+# Aggregate all results into one CSV + plot
+if [[ -s "${SUMMARY_LIST_FILE}" ]]; then
+  python scripts/aggregate_oracle_sweep.py \
+    --input_list "${SUMMARY_LIST_FILE}" \
+    --out_dir "${CROSS_OUT_DIR}"
+  echo "Cross-dataset summary: ${CROSS_OUT_DIR}"
+else
+  echo "No sweep_summary.csv files found; skipping aggregation."
+fi
+
+rm -f "${SUMMARY_LIST_FILE}"
