@@ -93,10 +93,22 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        self.densify_mode = "xyz"  # xyz | opacity
+        self.densify_opacity_threshold = 0.0002
+        self.densify_opacity_use_abs = False
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # A/B logging for densification comparison
+        self.ab_log = False
+        self.ab_log_interval = 100
+        self.ab_eval_views = 5
+        self.ab_eval_split = "test"
+        self.ab_lpips = False
+        self.ab_lpips_net = "vgg"
+        self.ab_seed = 0
+        self.ab_log_dir = ""
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

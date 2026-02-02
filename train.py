@@ -11,6 +11,7 @@
 
 import os
 import torch
+import random
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -40,6 +41,82 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+def _select_eval_views(scene, split, num_views, seed):
+    views = scene.getTestCameras() if split == "test" else scene.getTrainCameras()
+    split_used = split
+    if not views and split == "test":
+        # Fallback if test cameras are missing
+        views = scene.getTrainCameras()
+        split_used = "train"
+        print("Warning: no test cameras found; using train split for ab_log.")
+    if not views:
+        return [], [], split_used
+    num_views = min(num_views, len(views))
+    rng = random.Random(seed)
+    indices = list(range(len(views)))
+    rng.shuffle(indices)
+    chosen = [views[i] for i in indices[:num_views]]
+    return chosen, indices[:num_views], split_used
+
+def _eval_views_metrics(views, gaussians, pipe, background, use_trained_exp, lpips_model=None):
+    if not views:
+        return float("nan"), float("nan"), float("nan")
+    psnrs = []
+    l1s = []
+    lpipss = []
+    with torch.no_grad():
+        for view in views:
+            render_pkg = render(view, gaussians, pipe, background, use_trained_exp=use_trained_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            image = render_pkg["render"]
+            if view.alpha_mask is not None:
+                image = image * view.alpha_mask.cuda()
+            gt_image = view.original_image.cuda()
+            psnrs.append(psnr(image, gt_image).mean().item())
+            l1s.append(l1_loss(image, gt_image).mean().item())
+            if lpips_model is not None:
+                lp = lpips_model(image.unsqueeze(0), gt_image.unsqueeze(0))
+                lpipss.append(lp.item())
+    mean_psnr = float(sum(psnrs) / len(psnrs))
+    mean_l1 = float(sum(l1s) / len(l1s))
+    mean_lpips = float(sum(lpipss) / len(lpipss)) if lpipss else float("nan")
+    return mean_psnr, mean_l1, mean_lpips
+
+def _init_ab_logger(opt, scene, dataset):
+    if not opt.ab_log:
+        return None
+    log_dir = opt.ab_log_dir if opt.ab_log_dir else os.path.join(scene.model_path, "ab_logs", opt.densify_mode)
+    os.makedirs(log_dir, exist_ok=True)
+    csv_path = os.path.join(log_dir, "ab_metrics.csv")
+    eval_views, eval_indices, split_used = _select_eval_views(scene, opt.ab_eval_split, opt.ab_eval_views, opt.ab_seed)
+
+    lpips_model = None
+    if opt.ab_lpips:
+        from lpipsPyTorch.modules.lpips import LPIPS
+        lpips_model = LPIPS(net_type=opt.ab_lpips_net).cuda()
+
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write(f"# densify_mode={opt.densify_mode}\n")
+            f.write(f"# ab_eval_split={opt.ab_eval_split}, split_used={split_used}, ab_eval_views={opt.ab_eval_views}, ab_seed={opt.ab_seed}\n")
+            f.write(f"# eval_indices={eval_indices}\n")
+            f.write("iteration,num_points,mean_psnr,mean_l1,mean_lpips\n")
+
+    return {
+        "csv_path": csv_path,
+        "eval_views": eval_views,
+        "lpips_model": lpips_model
+    }
+
+def _ab_log_step(ab_state, iteration, gaussians, pipe, background, dataset):
+    if ab_state is None:
+        return
+    mean_psnr, mean_l1, mean_lpips = _eval_views_metrics(
+        ab_state["eval_views"], gaussians, pipe, background, dataset.train_test_exp, ab_state["lpips_model"]
+    )
+    num_points = int(gaussians.get_xyz.shape[0])
+    with open(ab_state["csv_path"], "a", encoding="utf-8") as f:
+        f.write(f"{iteration},{num_points},{mean_psnr},{mean_l1},{mean_lpips}\n")
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -50,6 +127,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    ab_state = _init_ab_logger(opt, scene, dataset)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -141,6 +219,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
+        dL_dalpha = None
+        if opt.densify_mode == "opacity":
+            with torch.no_grad():
+                alpha = gaussians.get_opacity
+                dlogit = gaussians._opacity.grad
+                if dlogit is not None:
+                    dL_dalpha = dlogit / (alpha * (1.0 - alpha) + 1e-6)
+
         iter_end.record()
 
         with torch.no_grad():
@@ -164,14 +250,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                if opt.densify_mode == "opacity":
+                    if dL_dalpha is not None:
+                        gaussians.add_opacity_densification_stats(dL_dalpha, visibility_filter, use_abs=opt.densify_opacity_use_abs)
+                else:
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    grad_threshold = opt.densify_grad_threshold if opt.densify_mode == "xyz" else opt.densify_opacity_threshold
+                    gaussians.densify_and_prune(grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, mode=opt.densify_mode)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            if opt.ab_log and iteration % opt.ab_log_interval == 0:
+                _ab_log_step(ab_state, iteration, gaussians, pipe, background, dataset)
 
             # Optimizer step
             if iteration < opt.iterations:
