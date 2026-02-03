@@ -92,6 +92,259 @@ def project_points(view, pts):
     return xi, yi, valid
 
 
+def project_world_points(view, pts):
+    H = int(view.image_height)
+    W = int(view.image_width)
+    device = pts.device
+    ones = torch.ones((pts.shape[0], 1), device=device, dtype=pts.dtype)
+    pts_hom = torch.cat([pts, ones], dim=1)
+    projmat = view.full_proj_transform
+    p_clip = pts_hom @ projmat
+    ndc = p_clip[:, :3] / (p_clip[:, 3:4] + 1e-8)
+    finite = torch.isfinite(ndc).all(dim=1)
+    x = ((ndc[:, 0] + 1.0) * W - 1.0) * 0.5
+    y = ((ndc[:, 1] + 1.0) * H - 1.0) * 0.5
+    xi = x.round().long()
+    yi = y.round().long()
+    valid = finite & (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+    return x, y, valid
+
+
+def get_intrinsics(view):
+    fx = fov2focal(view.FoVx, view.image_width)
+    fy = fov2focal(view.FoVy, view.image_height)
+    cx = view.image_width * 0.5
+    cy = view.image_height * 0.5
+    return fx, fy, cx, cy
+
+
+def compute_fundamental(view_a, view_b):
+    fx1, fy1, cx1, cy1 = get_intrinsics(view_a)
+    fx2, fy2, cx2, cy2 = get_intrinsics(view_b)
+    device = view_a.world_view_transform.device
+    K1 = torch.tensor([[fx1, 0.0, cx1], [0.0, fy1, cy1], [0.0, 0.0, 1.0]], device=device)
+    K2 = torch.tensor([[fx2, 0.0, cx2], [0.0, fy2, cy2], [0.0, 0.0, 1.0]], device=device)
+    # world_view_transform is stored for row-vector math. Transpose to standard column-vector form.
+    T1 = view_a.world_view_transform.transpose(0, 1)
+    T2 = view_b.world_view_transform.transpose(0, 1)
+    T = T2 @ torch.inverse(T1)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    tx = torch.tensor(
+        [
+            [0.0, -t[2], t[1]],
+            [t[2], 0.0, -t[0]],
+            [-t[1], t[0], 0.0],
+        ],
+        device="cuda",
+    )
+    F = torch.linalg.inv(K2).T @ tx @ R @ torch.linalg.inv(K1)
+    return F
+
+
+def line_segment_from_fundamental(view_a, view_b, px, py, downscale):
+    H = int(view_b.image_height)
+    W = int(view_b.image_width)
+    F = compute_fundamental(view_a, view_b)
+    x1 = torch.tensor([px, py, 1.0], device="cuda")
+    l = F @ x1
+    a = float(l[0].item())
+    b = float(l[1].item())
+    c = float(l[2].item())
+    if abs(a) + abs(b) < 1e-8:
+        return None
+
+    pts = []
+    # Intersect with x=0 and x=W-1
+    for x in (0.0, float(W - 1)):
+        if abs(b) > 1e-8:
+            y = -(a * x + c) / b
+            if 0.0 <= y <= H - 1:
+                pts.append((x, y))
+    # Intersect with y=0 and y=H-1
+    for y in (0.0, float(H - 1)):
+        if abs(a) > 1e-8:
+            x = -(b * y + c) / a
+            if 0.0 <= x <= W - 1:
+                pts.append((x, y))
+
+    if len(pts) < 2:
+        return None
+    x0, y0 = pts[0]
+    x1, y1 = pts[-1]
+    return x0 / downscale, y0 / downscale, x1 / downscale, y1 / downscale
+
+
+def ray_from_pixel(view, px, py):
+    fx, fy, cx, cy = get_intrinsics(view)
+    x_cam = (px + 0.5 - cx) / fx
+    y_cam = (py + 0.5 - cy) / fy
+    dir_cam = torch.tensor([x_cam, y_cam, 1.0, 0.0], device="cuda", dtype=torch.float32)
+    origin_cam = torch.tensor([0.0, 0.0, 0.0, 1.0], device="cuda", dtype=torch.float32)
+    view_inv = view.world_view_transform.inverse()
+    origin = (origin_cam @ view_inv)[:3]
+    direction = (dir_cam @ view_inv)[:3]
+    direction = direction / (torch.norm(direction) + 1e-8)
+    return origin, direction
+
+
+def closest_point_between_rays(o1, d1, o2, d2, eps=1e-6):
+    w0 = o1 - o2
+    a = torch.dot(d1, d1)
+    b = torch.dot(d1, d2)
+    c = torch.dot(d2, d2)
+    d = torch.dot(d1, w0)
+    e = torch.dot(d2, w0)
+    denom = a * c - b * b
+    if denom.abs() < eps:
+        return None
+    s = (b * e - c * d) / denom
+    t = (a * e - b * d) / denom
+    p1 = o1 + s * d1
+    p2 = o2 + t * d2
+    return 0.5 * (p1 + p2), s.item(), t.item(), torch.norm(p1 - p2).item()
+
+
+def extract_patch(img, x, y, r):
+    H, W = img.shape[-2], img.shape[-1]
+    x0 = x - r
+    x1 = x + r + 1
+    y0 = y - r
+    y1 = y + r + 1
+    if x0 < 0 or y0 < 0 or x1 > W or y1 > H:
+        return None
+    patch = img[:, y0:y1, x0:x1].contiguous().view(-1)
+    return patch
+
+
+def match_pixel_epipolar(
+    view_a,
+    view_b,
+    img_a,
+    img_b,
+    px,
+    py,
+    depth_min,
+    depth_max,
+    downscale,
+    patch_r,
+    max_samples,
+    min_ncc,
+    stats=None,
+):
+    # Downscale images for matching.
+    if downscale > 1:
+        img_a_ds = torch.nn.functional.interpolate(img_a.unsqueeze(0), scale_factor=1.0 / downscale, mode="bilinear", align_corners=False)[0]
+        img_b_ds = torch.nn.functional.interpolate(img_b.unsqueeze(0), scale_factor=1.0 / downscale, mode="bilinear", align_corners=False)[0]
+    else:
+        img_a_ds = img_a
+        img_b_ds = img_b
+
+    px_ds = int(round(px / downscale))
+    py_ds = int(round(py / downscale))
+    patch_a = extract_patch(img_a_ds, px_ds, py_ds, patch_r)
+    if patch_a is None:
+        if stats is not None:
+            stats["patch_a_fail"] += 1
+        return None
+    patch_a = patch_a - patch_a.mean()
+    norm_a = torch.norm(patch_a) + 1e-8
+
+    fx, fy, cx, cy = get_intrinsics(view_a)
+    p_world_near = pixel_to_world(view_a, px, py, depth_min, fx, fy, cx, cy)
+    p_world_far = pixel_to_world(view_a, px, py, depth_max, fx, fy, cx, cy)
+    line_pts = torch.stack([p_world_near, p_world_far], dim=0)
+    xs, ys, valid = project_world_points(view_b, line_pts)
+    finite = torch.isfinite(xs) & torch.isfinite(ys)
+
+    def try_depth_line():
+        if not finite.all():
+            return None
+        x0 = xs[0].item() / downscale
+        y0 = ys[0].item() / downscale
+        x1 = xs[1].item() / downscale
+        y1 = ys[1].item() / downscale
+
+        dx = x1 - x0
+        dy = y1 - y0
+        if abs(dx) < 1e-8:
+            if x0 < 0 or x0 > (img_b_ds.shape[-1] - 1):
+                return None
+            tx_min, tx_max = 0.0, 1.0
+        else:
+            tx0 = (0.0 - x0) / dx
+            tx1 = ((img_b_ds.shape[-1] - 1) - x0) / dx
+            tx_min, tx_max = min(tx0, tx1), max(tx0, tx1)
+
+        if abs(dy) < 1e-8:
+            if y0 < 0 or y0 > (img_b_ds.shape[-2] - 1):
+                return None
+            ty_min, ty_max = 0.0, 1.0
+        else:
+            ty0 = (0.0 - y0) / dy
+            ty1 = ((img_b_ds.shape[-2] - 1) - y0) / dy
+            ty_min, ty_max = min(ty0, ty1), max(ty0, ty1)
+
+        t_min = max(0.0, tx_min, ty_min)
+        t_max = min(1.0, tx_max, ty_max)
+        if t_max <= t_min:
+            return None
+        return x0, y0, x1, y1, t_min, t_max
+
+    line = try_depth_line()
+    if line is None:
+        fb = line_segment_from_fundamental(view_a, view_b, px, py, downscale)
+        if fb is None:
+            if stats is not None:
+                stats["line_fail"] += 1
+            return None
+        x0, y0, x1, y1 = fb
+        t_min, t_max = 0.0, 1.0
+    else:
+        x0, y0, x1, y1, t_min, t_max = line
+
+    if max_samples < 2:
+        max_samples = 2
+    dx = x1 - x0
+    dy = y1 - y0
+
+    t_vals = torch.linspace(t_min, t_max, steps=max_samples, device="cuda")
+    xs_line = x0 + dx * t_vals
+    ys_line = y0 + dy * t_vals
+
+    best_score = -1.0
+    best_px = None
+    best_py = None
+    H, W = img_b_ds.shape[-2], img_b_ds.shape[-1]
+    for x, y in zip(xs_line, ys_line):
+        xi = int(round(float(x)))
+        yi = int(round(float(y)))
+        if xi < 0 or yi < 0 or xi >= W or yi >= H:
+            if stats is not None:
+                stats["sample_oob"] += 1
+            continue
+        patch_b = extract_patch(img_b_ds, xi, yi, patch_r)
+        if patch_b is None:
+            if stats is not None:
+                stats["patch_b_fail"] += 1
+            continue
+        patch_b = patch_b - patch_b.mean()
+        denom = (norm_a * (torch.norm(patch_b) + 1e-8)).item()
+        if denom <= 0:
+            continue
+        ncc = float(torch.dot(patch_a, patch_b).item() / denom)
+        if ncc > best_score:
+            best_score = ncc
+            best_px = int(round(xi * downscale))
+            best_py = int(round(yi * downscale))
+
+    if best_score < float(min_ncc) or best_px is None:
+        if stats is not None:
+            stats["ncc_fail"] += 1
+        return None
+    return best_px, best_py, best_score
+
+
 def compute_gaussian_weights(gaussians, view, err_map, w_mode):
     xyz = gaussians.get_xyz.detach()
     xi, yi, valid = project_points(view, xyz)
@@ -335,7 +588,7 @@ def pixel_to_world(view, px, py, depth, fx, fy, cx, cy):
     y_cam = (py + 0.5 - cy) / fy
     p_cam = torch.tensor([x_cam * depth, y_cam * depth, depth, 1.0], device="cuda", dtype=torch.float32)
     view_inv = view.world_view_transform.inverse()
-    p_world = (view_inv @ p_cam)[:3]
+    p_world = (p_cam @ view_inv)[:3]
     return p_world
 
 
@@ -421,7 +674,7 @@ def main():
     parser.add_argument("--weight_num_views", default=1, type=int)
     parser.add_argument("--weight_view_stride", default=1, type=int)
     parser.add_argument("--weight_view_indices", default="", type=str)
-    parser.add_argument("--proposal_mode", default="pixel_depth", choices=["pixel_depth", "gaussian_perturb"])
+    parser.add_argument("--proposal_mode", default="pixel_depth", choices=["pixel_depth", "gaussian_perturb", "triangulate"])
     parser.add_argument(
         "--w_mode",
         default="error",
@@ -440,6 +693,12 @@ def main():
     parser.add_argument("--kf", default=400, type=int)
     parser.add_argument("--rc", default=2.0, type=float)
     parser.add_argument("--rf", default=0.5, type=float)
+    parser.add_argument("--triang_view_indices", default="", type=str, help="Comma list of secondary views for triangulation.")
+    parser.add_argument("--triang_downscale", default=1, type=int, help="Downscale factor for epipolar matching.")
+    parser.add_argument("--triang_patch", default=3, type=int, help="Patch radius for NCC matching.")
+    parser.add_argument("--triang_max_samples", default=64, type=int, help="Samples along epipolar line.")
+    parser.add_argument("--triang_min_ncc", default=0.6, type=float, help="Minimum NCC to accept match.")
+    parser.add_argument("--triang_max_ray_dist", default=0.0, type=float, help="Max ray-ray distance for triangulation (0=auto).")
     parser.add_argument("--refine_steps", default=0, type=int, help="Number of candidate refinement steps (0 disables).")
     parser.add_argument("--refine_lr", default=0.0, type=float, help="Learning rate for candidate refinement.")
     parser.add_argument("--refine_params", default="xyz", type=str, help="Comma list: xyz,scaling,rotation")
@@ -534,7 +793,7 @@ def main():
     weight_view_indices = [args.view_index]
     weight_views = [view]
     weight_err_maps = [err]
-    # Multi-view weighting only needed for gaussian_perturb.
+    # Multi-view weighting used for gaussian_perturb and triangulate (for relocation/diagnostics).
     if args.proposal_mode != "pixel_depth":
         weight_view_indices = parse_int_list(args.weight_view_indices)
         if not weight_view_indices:
@@ -656,6 +915,185 @@ def main():
 
         cand_rotation = torch.zeros((n_cand, 4), device="cuda")
         cand_rotation[:, 0] = 1.0
+    elif args.proposal_mode == "triangulate":
+        # Triangulation proposal via epipolar matching across views.
+        mask = torch.ones_like(err, dtype=torch.bool)
+        if view.alpha_mask is not None:
+            mask = mask & (view.alpha_mask[0].cuda() > 0.5)
+        coords = mask.nonzero(as_tuple=False)
+        if coords.numel() == 0:
+            raise RuntimeError("No valid pixels for triangulation proposal.")
+        scores = err[mask]
+        topk = min(args.num_pixels, scores.numel())
+        vals, idx = torch.topk(scores, k=topk, largest=True)
+        pix = coords[idx]
+
+        triang_view_indices = parse_int_list(args.triang_view_indices)
+        if not triang_view_indices:
+            triang_view_indices = [i for i in weight_view_indices if i != args.view_index]
+        triang_view_indices = [i for i in triang_view_indices if 0 <= i < len(views) and i != args.view_index]
+        if not triang_view_indices:
+            raise RuntimeError("No secondary views available for triangulation.")
+
+        fx = fov2focal(view.FoVx, view.image_width)
+        fy = fov2focal(view.FoVy, view.image_height)
+        cx = view.image_width * 0.5
+        cy = view.image_height * 0.5
+
+        base_scale = gaussians.get_scaling.detach()
+        med_scale = torch.median(base_scale, dim=0).values
+        min_scale = med_scale * float(args.scale_min_mult)
+        max_scale = med_scale * float(args.scale_max_mult)
+        if args.triang_max_ray_dist > 0:
+            max_ray_dist = float(args.triang_max_ray_dist)
+        else:
+            max_ray_dist = float(torch.max(med_scale).item() * float(args.scale_factor) * 2.0)
+
+        cand_xyz_list = []
+        cand_dc_list = []
+        cand_depth_list = []
+        cand_views = []
+
+        img_base = view.original_image.cuda()
+        # Debug counters
+        dbg_total = 0
+        dbg_match_calls = 0
+        dbg_stats = {
+            "line_fail": 0,
+            "patch_a_fail": 0,
+            "patch_b_fail": 0,
+            "sample_oob": 0,
+            "ncc_fail": 0,
+        }
+        dbg_tri_none = 0
+        dbg_tri_behind = 0
+        dbg_tri_dist = 0
+        dbg_tri_depth = 0
+        dbg_success = 0
+        for yx in pix:
+            py = int(yx[0].item())
+            px = int(yx[1].item())
+            rgb = img_base[:, py, px].unsqueeze(0)
+            dc = RGB2SH(rgb).squeeze(0)
+
+            matched = False
+            dbg_total += 1
+            for vidx in triang_view_indices:
+                v2 = views[vidx]
+                img2 = v2.original_image.cuda()
+                dbg_match_calls += 1
+                match = match_pixel_epipolar(
+                    view, v2, img_base, img2, px, py,
+                    float(args.depth_min), float(args.depth_max),
+                    int(args.triang_downscale),
+                    int(args.triang_patch),
+                    int(args.triang_max_samples),
+                    float(args.triang_min_ncc),
+                    stats=dbg_stats,
+                )
+                if match is None:
+                    continue
+                px2, py2, _ncc = match
+                o1, d1 = ray_from_pixel(view, px, py)
+                o2, d2 = ray_from_pixel(v2, px2, py2)
+                res = closest_point_between_rays(o1, d1, o2, d2)
+                if res is None:
+                    dbg_tri_none += 1
+                    continue
+                p_world, s, t, dist = res
+                if s <= 0 or t <= 0:
+                    dbg_tri_behind += 1
+                    continue
+                if dist > max_ray_dist:
+                    dbg_tri_dist += 1
+                    continue
+                if s < float(args.depth_min) or s > float(args.depth_max):
+                    dbg_tri_depth += 1
+                    continue
+                cand_xyz_list.append(p_world)
+                cand_dc_list.append(dc)
+                cand_depth_list.append(float(s))
+                cand_views.append(vidx)
+                matched = True
+                dbg_success += 1
+                break
+            if not matched:
+                continue
+            if len(cand_xyz_list) >= args.max_candidates:
+                break
+
+        if not cand_xyz_list:
+            print(
+                "Triangulation debug: "
+                f"total={dbg_total} "
+                f"match_calls={dbg_match_calls} "
+                f"line_fail={dbg_stats['line_fail']} "
+                f"patch_a_fail={dbg_stats['patch_a_fail']} "
+                f"patch_b_fail={dbg_stats['patch_b_fail']} "
+                f"sample_oob={dbg_stats['sample_oob']} "
+                f"ncc_fail={dbg_stats['ncc_fail']} "
+                f"tri_none={dbg_tri_none} "
+                f"tri_behind={dbg_tri_behind} "
+                f"tri_dist={dbg_tri_dist} "
+                f"tri_depth={dbg_tri_depth} "
+                f"success={dbg_success}"
+            )
+            raise RuntimeError("No triangulated candidates built.")
+
+        cand_xyz = torch.stack(cand_xyz_list, dim=0)
+        cand_dc = torch.stack(cand_dc_list, dim=0)
+        cand_depth = torch.tensor(cand_depth_list, device="cuda", dtype=torch.float32)
+        n_cand = cand_xyz.shape[0]
+
+        print(
+            "Triangulation debug: "
+            f"total={dbg_total} "
+            f"match_calls={dbg_match_calls} "
+            f"line_fail={dbg_stats['line_fail']} "
+            f"patch_a_fail={dbg_stats['patch_a_fail']} "
+            f"patch_b_fail={dbg_stats['patch_b_fail']} "
+            f"sample_oob={dbg_stats['sample_oob']} "
+            f"ncc_fail={dbg_stats['ncc_fail']} "
+            f"tri_none={dbg_tri_none} "
+            f"tri_behind={dbg_tri_behind} "
+            f"tri_dist={dbg_tri_dist} "
+            f"tri_depth={dbg_tri_depth} "
+            f"success={dbg_success} "
+            f"cands={n_cand}"
+        )
+
+        cand_features_dc = cand_dc.view(n_cand, 3, 1).transpose(1, 2).contiguous()
+        n_sh = (gaussians.max_sh_degree + 1) ** 2
+        n_rest = n_sh - 1
+        if n_rest > 0:
+            cand_features_rest = torch.zeros((n_cand, n_rest, 3), device="cuda")
+        else:
+            cand_features_rest = torch.zeros((n_cand, 0, 3), device="cuda")
+
+        cand_sigma_x = cand_depth / fx
+        cand_sigma_y = cand_depth / fy
+        cand_sigma = torch.maximum(cand_sigma_x, cand_sigma_y) * float(args.scale_factor)
+        cand_sigma = torch.clamp(cand_sigma, min=min_scale.min().item(), max=max_scale.max().item())
+        cand_scale = torch.stack([cand_sigma, cand_sigma, cand_sigma], dim=1)
+        cand_scaling = torch.log(cand_scale)
+
+        cand_rotation = torch.zeros((n_cand, 4), device="cuda")
+        cand_rotation[:, 0] = 1.0
+
+        depth_source = f"proposal:triangulate/views={','.join(str(i) for i in triang_view_indices)}"
+        if args.w_mode in ("resp", "resp_opacity"):
+            weights = compute_gaussian_weights_responsibility(
+                gaussians,
+                weight_views,
+                pipe,
+                background,
+                opt.lambda_dssim,
+                dataset.train_test_exp,
+                args.w_mode,
+            )
+        else:
+            weights = compute_gaussian_weights_multi(gaussians, weight_views, weight_err_maps, args.w_mode)
+
     else:
         # Proposal by perturbing existing Gaussians (no depth hypotheses).
         weight_tag = ",".join(str(i) for i in weight_view_indices)
