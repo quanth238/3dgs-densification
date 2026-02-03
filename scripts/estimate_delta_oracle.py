@@ -9,6 +9,7 @@ import sys
 import random
 import csv
 import math
+import json
 from argparse import ArgumentParser
 from collections import defaultdict
 
@@ -165,6 +166,43 @@ def compute_gaussian_weights_multi(gaussians, views, err_maps, w_mode):
     return w
 
 
+def compute_gaussian_weights_responsibility(gaussians, views, pipe, background, lambda_dssim, use_trained_exp, w_mode):
+    xyz = gaussians.get_xyz.detach()
+    n = xyz.shape[0]
+    device = xyz.device
+    w = torch.zeros((n,), device=device, dtype=xyz.dtype)
+    opacity_logit = gaussians._opacity
+    if opacity_logit.grad is not None:
+        opacity_logit.grad = None
+
+    for v in views:
+        render_pkg = render(v, gaussians, pipe, background, use_trained_exp=use_trained_exp)
+        img = render_pkg["render"]
+        if v.alpha_mask is not None:
+            img = img * v.alpha_mask.cuda()
+        gt = v.original_image.cuda()
+        loss = compute_loss(img, gt, lambda_dssim)
+        grad = torch.autograd.grad(
+            loss,
+            opacity_logit,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )[0]
+        if grad is None:
+            continue
+        alpha = torch.sigmoid(opacity_logit.detach())
+        dL_dalpha = grad / (alpha * (1.0 - alpha) + 1e-6)
+        w += torch.abs(dL_dalpha.squeeze(-1))
+
+    if w_mode == "resp_opacity":
+        w = w * torch.sigmoid(opacity_logit.detach()).squeeze(-1)
+
+    if torch.sum(w) <= 0:
+        w.fill_(1.0)
+    return w
+
+
 def sample_candidates_from_gaussians(gaussians, parent_idx, radius, scale_factor):
     if parent_idx.numel() == 0:
         return None
@@ -193,6 +231,103 @@ def sample_candidates_from_gaussians(gaussians, parent_idx, radius, scale_factor
         "rotation": parent_rotation,
     }
     return cand
+
+
+def refine_candidates(
+    gaussians,
+    cand_xyz,
+    cand_features_dc,
+    cand_features_rest,
+    cand_scaling,
+    cand_rotation,
+    view,
+    pipe,
+    background,
+    alpha0,
+    lambda_dssim,
+    use_trained_exp,
+    refine_steps,
+    refine_lr,
+    refine_params,
+):
+    if refine_steps <= 0 or refine_lr <= 0:
+        return cand_xyz, cand_scaling, cand_rotation
+    params = {p.strip() for p in refine_params.split(",") if p.strip()}
+    refine_xyz = "xyz" in params
+    refine_scaling = "scaling" in params
+    refine_rotation = "rotation" in params
+    if not (refine_xyz or refine_scaling or refine_rotation):
+        return cand_xyz, cand_scaling, cand_rotation
+
+    base_count = gaussians._xyz.shape[0]
+    n_cand = cand_xyz.shape[0]
+    logit0 = inverse_sigmoid(torch.tensor(alpha0, device="cuda"))
+    cand_opacity = logit0.view(1, 1).repeat(n_cand, 1)
+
+    combined = GaussianModel(gaussians.max_sh_degree, gaussians.optimizer_type)
+    combined.active_sh_degree = gaussians.active_sh_degree
+    combined._xyz = nn.Parameter(
+        torch.cat([gaussians._xyz.detach(), cand_xyz], dim=0),
+        requires_grad=refine_xyz,
+    )
+    combined._features_dc = nn.Parameter(
+        torch.cat([gaussians._features_dc.detach(), cand_features_dc], dim=0),
+        requires_grad=False,
+    )
+    combined._features_rest = nn.Parameter(
+        torch.cat([gaussians._features_rest.detach(), cand_features_rest], dim=0),
+        requires_grad=False,
+    )
+    combined._scaling = nn.Parameter(
+        torch.cat([gaussians._scaling.detach(), cand_scaling], dim=0),
+        requires_grad=refine_scaling,
+    )
+    combined._rotation = nn.Parameter(
+        torch.cat([gaussians._rotation.detach(), cand_rotation], dim=0),
+        requires_grad=refine_rotation,
+    )
+    combined._opacity = nn.Parameter(
+        torch.cat([gaussians._opacity.detach(), cand_opacity], dim=0),
+        requires_grad=False,
+    )
+    combined.max_radii2D = torch.zeros((combined._xyz.shape[0]), device="cuda")
+    if use_trained_exp and hasattr(gaussians, "_exposure"):
+        combined.exposure_mapping = getattr(gaussians, "exposure_mapping", None)
+        combined.pretrained_exposures = getattr(gaussians, "pretrained_exposures", None)
+        combined._exposure = gaussians._exposure
+
+    for _ in range(int(refine_steps)):
+        render_pkg = render(view, combined, pipe, background, use_trained_exp=use_trained_exp)
+        img = render_pkg["render"]
+        if view.alpha_mask is not None:
+            img = img * view.alpha_mask.cuda()
+        gt = view.original_image.cuda()
+        loss = compute_loss(img, gt, lambda_dssim)
+        loss.backward()
+
+        with torch.no_grad():
+            if refine_xyz and combined._xyz.grad is not None:
+                combined._xyz[base_count:] -= float(refine_lr) * combined._xyz.grad[base_count:]
+            if refine_scaling and combined._scaling.grad is not None:
+                combined._scaling[base_count:] -= float(refine_lr) * combined._scaling.grad[base_count:]
+            if refine_rotation and combined._rotation.grad is not None:
+                combined._rotation[base_count:] -= float(refine_lr) * combined._rotation.grad[base_count:]
+                q = combined._rotation[base_count:]
+                q = q / (torch.norm(q, dim=1, keepdim=True) + 1e-8)
+                combined._rotation[base_count:] = q
+
+        if combined._xyz.grad is not None:
+            combined._xyz.grad = None
+        if combined._scaling.grad is not None:
+            combined._scaling.grad = None
+        if combined._rotation.grad is not None:
+            combined._rotation.grad = None
+
+    return (
+        combined._xyz[base_count:].detach(),
+        combined._scaling[base_count:].detach(),
+        combined._rotation[base_count:].detach(),
+    )
 
 
 def pixel_to_world(view, px, py, depth, fx, fy, cx, cy):
@@ -287,11 +422,34 @@ def main():
     parser.add_argument("--weight_view_stride", default=1, type=int)
     parser.add_argument("--weight_view_indices", default="", type=str)
     parser.add_argument("--proposal_mode", default="pixel_depth", choices=["pixel_depth", "gaussian_perturb"])
-    parser.add_argument("--w_mode", default="error", choices=["error", "opacity", "error_opacity", "uniform"])
+    parser.add_argument(
+        "--w_mode",
+        default="error",
+        choices=[
+            "error",
+            "opacity",
+            "error_opacity",
+            "uniform",
+            "resp",
+            "resp_opacity",
+            "responsibility",
+            "responsibility_opacity",
+        ],
+    )
     parser.add_argument("--kc", default=400, type=int)
     parser.add_argument("--kf", default=400, type=int)
     parser.add_argument("--rc", default=2.0, type=float)
     parser.add_argument("--rf", default=0.5, type=float)
+    parser.add_argument("--refine_steps", default=0, type=int, help="Number of candidate refinement steps (0 disables).")
+    parser.add_argument("--refine_lr", default=0.0, type=float, help="Learning rate for candidate refinement.")
+    parser.add_argument("--refine_params", default="xyz", type=str, help="Comma list: xyz,scaling,rotation")
+    # Optional relocation (fixed-budget) after candidate scoring.
+    parser.add_argument("--relocate", action="store_true", help="Relocate low-importance Gaussians to top candidates.")
+    parser.add_argument("--relocate_num", default=0, type=int, help="Number of Gaussians to relocate.")
+    parser.add_argument("--relocate_frac", default=0.0, type=float, help="Fraction of Gaussians to relocate (overrides relocate_num if >0).")
+    parser.add_argument("--relocate_by", default="opacity", choices=["opacity", "weight"], help="Select dead Gaussians by opacity or proposal weight.")
+    parser.add_argument("--relocate_alpha", default=0.1, type=float, help="Opacity (alpha) for relocated Gaussians.")
+    parser.add_argument("--relocate_out", default="", type=str, help="Output model dir for relocated point cloud.")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--out_dir", default="", type=str)
     parser.add_argument("--no_plot", action="store_true")
@@ -304,6 +462,12 @@ def main():
         args = get_combined_args(parser)
     else:
         args = args_cmdline
+
+    # Normalize aliases for responsibility-based weighting.
+    if args.w_mode == "responsibility":
+        args.w_mode = "resp"
+    elif args.w_mode == "responsibility_opacity":
+        args.w_mode = "resp_opacity"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -379,25 +543,26 @@ def main():
         if not weight_view_indices:
             weight_view_indices = [args.view_index]
 
-        weight_views = []
-        weight_err_maps = []
-        for idx in weight_view_indices:
-            v = views[idx]
-            if idx == args.view_index:
-                weight_views.append(v)
-                weight_err_maps.append(err)
-                continue
-            with torch.no_grad():
-                render_pkg_w = render(v, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp)
-                img_w = render_pkg_w["render"]
-                if v.alpha_mask is not None:
-                    img_w = img_w * v.alpha_mask.cuda()
-                gt_w = v.original_image.cuda()
-                err_w = torch.mean(torch.abs(img_w - gt_w), dim=0)
-                if v.alpha_mask is not None:
-                    err_w = err_w * v.alpha_mask[0].cuda()
-                weight_views.append(v)
-                weight_err_maps.append(err_w)
+    weight_views = []
+    weight_err_maps = []
+    for idx in weight_view_indices:
+        v = views[idx]
+        weight_views.append(v)
+        if args.w_mode in ("resp", "resp_opacity"):
+            continue
+        if idx == args.view_index:
+            weight_err_maps.append(err)
+            continue
+        with torch.no_grad():
+            render_pkg_w = render(v, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp)
+            img_w = render_pkg_w["render"]
+            if v.alpha_mask is not None:
+                img_w = img_w * v.alpha_mask.cuda()
+            gt_w = v.original_image.cuda()
+            err_w = torch.mean(torch.abs(img_w - gt_w), dim=0)
+            if v.alpha_mask is not None:
+                err_w = err_w * v.alpha_mask[0].cuda()
+            weight_err_maps.append(err_w)
 
     cand_xyz = None
     cand_features_dc = None
@@ -406,6 +571,7 @@ def main():
     cand_rotation = None
     n_cand = 0
 
+    weights = None
     if args.proposal_mode == "pixel_depth":
         depth = torch.zeros_like(invdepth)
         inv_mask = invdepth > 1e-6
@@ -494,7 +660,18 @@ def main():
         # Proposal by perturbing existing Gaussians (no depth hypotheses).
         weight_tag = ",".join(str(i) for i in weight_view_indices)
         depth_source = f"proposal:{args.proposal_mode}/{args.w_mode}/views={weight_tag}"
-        weights = compute_gaussian_weights_multi(gaussians, weight_views, weight_err_maps, args.w_mode)
+        if args.w_mode in ("resp", "resp_opacity"):
+            weights = compute_gaussian_weights_responsibility(
+                gaussians,
+                weight_views,
+                pipe,
+                background,
+                opt.lambda_dssim,
+                dataset.train_test_exp,
+                args.w_mode,
+            )
+        else:
+            weights = compute_gaussian_weights_multi(gaussians, weight_views, weight_err_maps, args.w_mode)
         weights = weights / torch.sum(weights)
 
         kc = max(int(args.kc), 0)
@@ -536,6 +713,25 @@ def main():
         cand_rotation = torch.cat(cand_rotation_list, dim=0)
         n_cand = cand_xyz.shape[0]
 
+    if args.refine_steps > 0 and args.refine_lr > 0:
+        cand_xyz, cand_scaling, cand_rotation = refine_candidates(
+            gaussians,
+            cand_xyz,
+            cand_features_dc,
+            cand_features_rest,
+            cand_scaling,
+            cand_rotation,
+            view,
+            pipe,
+            background,
+            float(args.alpha0),
+            opt.lambda_dssim,
+            dataset.train_test_exp,
+            int(args.refine_steps),
+            float(args.refine_lr),
+            args.refine_params,
+        )
+
     alpha0 = float(args.alpha0)
     alpha0 = min(max(alpha0, 1e-6), 1.0 - 1e-6)
     logit0 = inverse_sigmoid(torch.tensor(alpha0, device="cuda"))
@@ -574,7 +770,8 @@ def main():
     dL_dalpha = dlogit / (alpha * (1.0 - alpha) + 1e-6)
 
     base_count = gaussians._xyz.shape[0]
-    g = dL_dalpha[base_count:].squeeze(-1).detach().cpu().numpy()
+    g_t = dL_dalpha[base_count:].squeeze(-1).detach()
+    g = g_t.cpu().numpy()
 
     radii = render_pkg2.get("radii", None)
     if radii is not None:
@@ -624,6 +821,48 @@ def main():
     g_min = float(np.min(g))
     g_mean = float(np.mean(g))
 
+    # Optional relocation: move low-importance Gaussians to top candidates (fixed-budget).
+    if args.relocate:
+        n_total = gaussians.get_xyz.shape[0]
+        relocate_num = int(args.relocate_num)
+        if args.relocate_frac and args.relocate_frac > 0:
+            relocate_num = int(max(1, round(args.relocate_frac * n_total)))
+        relocate_num = min(relocate_num, n_cand)
+        if relocate_num <= 0:
+            print("Relocate requested but relocate_num <= 0; skipping relocation.")
+        else:
+            top_idx = torch.argsort(g_t)[:relocate_num]
+            if args.relocate_by == "weight" and weights is not None:
+                dead_scores = weights.detach()
+            else:
+                dead_scores = torch.sigmoid(gaussians._opacity.detach()).squeeze(-1)
+            dead_idx = torch.argsort(dead_scores)[:relocate_num]
+
+            alpha_reloc = float(args.relocate_alpha)
+            alpha_reloc = min(max(alpha_reloc, 1e-6), 1.0 - 1e-6)
+            logit_reloc = inverse_sigmoid(torch.tensor(alpha_reloc, device="cuda", dtype=gaussians._opacity.dtype))
+            with torch.no_grad():
+                gaussians._xyz[dead_idx] = cand_xyz[top_idx]
+                gaussians._features_dc[dead_idx] = cand_features_dc[top_idx]
+                gaussians._features_rest[dead_idx] = cand_features_rest[top_idx]
+                gaussians._scaling[dead_idx] = cand_scaling[top_idx]
+                gaussians._rotation[dead_idx] = cand_rotation[top_idx]
+                gaussians._opacity[dead_idx] = logit_reloc.view(1, 1).repeat(relocate_num, 1)
+
+            out_model = args.relocate_out or os.path.join(dataset.model_path, "proposal_relocate")
+            out_pc = os.path.join(out_model, "point_cloud", f"iteration_{args.iteration}")
+            os.makedirs(out_pc, exist_ok=True)
+            gaussians.save_ply(os.path.join(out_pc, "point_cloud.ply"))
+            if dataset.train_test_exp and hasattr(gaussians, "exposure_mapping"):
+                exposure_dict = {
+                    image_name: gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
+                    for image_name in gaussians.exposure_mapping
+                }
+                os.makedirs(out_model, exist_ok=True)
+                with open(os.path.join(out_model, "exposure.json"), "w", encoding="utf-8") as f:
+                    json.dump(exposure_dict, f, indent=2)
+            print(f"Relocated {relocate_num} Gaussians -> {out_pc}")
+
     out_dir = args.out_dir or os.path.join(dataset.model_path, "oracle_verify", "delta_oracle")
     os.makedirs(out_dir, exist_ok=True)
     out_csv = os.path.join(out_dir, "delta_oracle_summary.csv")
@@ -634,13 +873,14 @@ def main():
         writer.writerow([
             "iteration","view_index","alpha0","scale_factor","depth_multipliers","depth_source",
             "pcd_coverage","visible_ratio","g_min","g_mean","tail_tau","tail_frac","num_candidates",
-            "proposal_mode","w_mode","rc","rf","kc","kf"
+            "proposal_mode","w_mode","rc","rf","kc","kf","refine_steps","refine_lr","refine_params"
         ])
         pcd_ratio = float((invdepth_pcd > 0).float().mean().item()) if invdepth_pcd is not None else float("nan")
         writer.writerow([
             args.iteration, args.view_index, alpha0, args.scale_factor, args.depth_multipliers, depth_source,
             pcd_ratio, visible_ratio, g_min, g_mean, args.tau, tail_frac, n_cand,
-            args.proposal_mode, args.w_mode, args.rc, args.rf, args.kc, args.kf
+            args.proposal_mode, args.w_mode, args.rc, args.rf, args.kc, args.kf,
+            args.refine_steps, args.refine_lr, args.refine_params
         ])
 
         f.write("\n# by_K\n")

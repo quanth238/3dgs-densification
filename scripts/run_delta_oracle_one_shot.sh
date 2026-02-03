@@ -4,49 +4,41 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_delta_oracle_sweep.sh \
+  bash scripts/run_delta_oracle_one_shot.sh \
     --source_path /path/to/dataset \
     --model_path ./experiment/scene \
     --images images_4 \
-    --iters "1000,3000,7000" \
-    --view_index 0 --num_views 5 --view_stride 10 \
-    --alpha0 1e-2 --scale_factor 3.0 \
-    --depth_multipliers "0.5,0.7,0.9,1.0" \
-    --k_list "50,100,200,400" \
-    [--proposal_mode gaussian_perturb] [--w_mode opacity] \
-    [--rc 3.0 --rf 0.25 --kc 200 --kf 400] \
-    [--weight_num_views 1 --weight_view_stride 1 --weight_view_indices ""] \
-    [--relocate --relocate_num 0 --relocate_frac 0.0 --relocate_by opacity --relocate_alpha 0.1 --relocate_out /path] \
-    --use_pcd_depth --pcd_fallback_render
-
-Outputs:
-  <model_path>/oracle_verify/delta_oracle/delta_oracle_summary.csv (per run)
-  <model_path>/oracle_verify/delta_oracle/delta_oracle_summary.png (per run)
+    --iteration 3000 --split train --view_index 0 \
+    --proposal_mode gaussian_perturb --w_mode resp \
+    --weight_num_views 5 --weight_view_stride 10 \
+    --rc 5.0 --rf 0.25 --kc 200 --kf 400 \
+    --k_list "50,100,200,400" --num_trials 20 \
+    --relocate --relocate_frac 0.02 --relocate_by weight --relocate_alpha 0.1 \
+    --relocate_out ./experiment/scene/proposal_relocate_resp \
+    --out_dir ./experiment/scene/oracle_verify/delta_oracle_one_shot
 EOF
 }
 
 SOURCE_PATH=""
 MODEL_PATH=""
 IMAGES=""
-ITERS="3000"
+ITERATION="3000"
 SPLIT="train"
 VIEW_INDEX="0"
-NUM_VIEWS="1"
-VIEW_STRIDE="1"
 NUM_PIXELS="200"
 ALPHA0="1e-2"
 SCALE_FACTOR="3.0"
 DEPTH_MULTS="0.5,0.7,0.9,1.0"
 K_LIST="50,100,200,400"
 NUM_TRIALS="20"
-PROPOSAL_MODE=""
-W_MODE=""
-RC=""
-RF=""
-KC=""
-KF=""
-WEIGHT_NUM_VIEWS=""
-WEIGHT_VIEW_STRIDE=""
+PROPOSAL_MODE="gaussian_perturb"
+W_MODE="resp"
+RC="5.0"
+RF="0.25"
+KC="200"
+KF="400"
+WEIGHT_NUM_VIEWS="5"
+WEIGHT_VIEW_STRIDE="10"
 WEIGHT_VIEW_INDICES=""
 USE_DATASET_DEPTH="0"
 USE_PCD_DEPTH="0"
@@ -57,17 +49,16 @@ RELOCATE_FRAC=""
 RELOCATE_BY=""
 RELOCATE_ALPHA=""
 RELOCATE_OUT=""
+OUT_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --source_path) SOURCE_PATH="$2"; shift 2;;
     --model_path) MODEL_PATH="$2"; shift 2;;
     --images) IMAGES="$2"; shift 2;;
-    --iters) ITERS="$2"; shift 2;;
+    --iteration) ITERATION="$2"; shift 2;;
     --split) SPLIT="$2"; shift 2;;
     --view_index) VIEW_INDEX="$2"; shift 2;;
-    --num_views) NUM_VIEWS="$2"; shift 2;;
-    --view_stride) VIEW_STRIDE="$2"; shift 2;;
     --num_pixels) NUM_PIXELS="$2"; shift 2;;
     --alpha0) ALPHA0="$2"; shift 2;;
     --scale_factor) SCALE_FACTOR="$2"; shift 2;;
@@ -83,15 +74,16 @@ while [[ $# -gt 0 ]]; do
     --weight_num_views) WEIGHT_NUM_VIEWS="$2"; shift 2;;
     --weight_view_stride) WEIGHT_VIEW_STRIDE="$2"; shift 2;;
     --weight_view_indices) WEIGHT_VIEW_INDICES="$2"; shift 2;;
+    --use_dataset_depth) USE_DATASET_DEPTH="1"; shift 1;;
+    --use_pcd_depth) USE_PCD_DEPTH="1"; shift 1;;
+    --pcd_fallback_render) PCD_FALLBACK="1"; shift 1;;
     --relocate) RELOCATE="1"; shift 1;;
     --relocate_num) RELOCATE_NUM="$2"; shift 2;;
     --relocate_frac) RELOCATE_FRAC="$2"; shift 2;;
     --relocate_by) RELOCATE_BY="$2"; shift 2;;
     --relocate_alpha) RELOCATE_ALPHA="$2"; shift 2;;
     --relocate_out) RELOCATE_OUT="$2"; shift 2;;
-    --use_dataset_depth) USE_DATASET_DEPTH="1"; shift 1;;
-    --use_pcd_depth) USE_PCD_DEPTH="1"; shift 1;;
-    --pcd_fallback_render) PCD_FALLBACK="1"; shift 1;;
+    --out_dir) OUT_DIR="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
   esac
@@ -103,15 +95,18 @@ if [[ -z "${SOURCE_PATH}" || -z "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
-OUT_BASE="${MODEL_PATH}/oracle_verify/delta_oracle"
-mkdir -p "${OUT_BASE}"
-
 COMMON_ARGS=(--source_path "${SOURCE_PATH}" --model_path "${MODEL_PATH}" --split "${SPLIT}" \
   --num_pixels "${NUM_PIXELS}" --alpha0 "${ALPHA0}" --scale_factor "${SCALE_FACTOR}" \
-  --depth_multipliers "${DEPTH_MULTS}" --k_list "${K_LIST}" --num_trials "${NUM_TRIALS}")
+  --depth_multipliers "${DEPTH_MULTS}" --k_list "${K_LIST}" --num_trials "${NUM_TRIALS}" \
+  --proposal_mode "${PROPOSAL_MODE}" --w_mode "${W_MODE}" --rc "${RC}" --rf "${RF}" \
+  --kc "${KC}" --kf "${KF}" --weight_num_views "${WEIGHT_NUM_VIEWS}" \
+  --weight_view_stride "${WEIGHT_VIEW_STRIDE}")
 
 if [[ -n "${IMAGES}" ]]; then
   COMMON_ARGS+=(--images "${IMAGES}")
+fi
+if [[ -n "${WEIGHT_VIEW_INDICES}" ]]; then
+  COMMON_ARGS+=(--weight_view_indices "${WEIGHT_VIEW_INDICES}")
 fi
 if [[ "${USE_DATASET_DEPTH}" == "1" ]]; then
   COMMON_ARGS+=(--use_dataset_depth)
@@ -121,33 +116,6 @@ if [[ "${USE_PCD_DEPTH}" == "1" ]]; then
 fi
 if [[ "${PCD_FALLBACK}" == "1" ]]; then
   COMMON_ARGS+=(--pcd_fallback_render)
-fi
-if [[ -n "${PROPOSAL_MODE}" ]]; then
-  COMMON_ARGS+=(--proposal_mode "${PROPOSAL_MODE}")
-fi
-if [[ -n "${W_MODE}" ]]; then
-  COMMON_ARGS+=(--w_mode "${W_MODE}")
-fi
-if [[ -n "${RC}" ]]; then
-  COMMON_ARGS+=(--rc "${RC}")
-fi
-if [[ -n "${RF}" ]]; then
-  COMMON_ARGS+=(--rf "${RF}")
-fi
-if [[ -n "${KC}" ]]; then
-  COMMON_ARGS+=(--kc "${KC}")
-fi
-if [[ -n "${KF}" ]]; then
-  COMMON_ARGS+=(--kf "${KF}")
-fi
-if [[ -n "${WEIGHT_NUM_VIEWS}" ]]; then
-  COMMON_ARGS+=(--weight_num_views "${WEIGHT_NUM_VIEWS}")
-fi
-if [[ -n "${WEIGHT_VIEW_STRIDE}" ]]; then
-  COMMON_ARGS+=(--weight_view_stride "${WEIGHT_VIEW_STRIDE}")
-fi
-if [[ -n "${WEIGHT_VIEW_INDICES}" ]]; then
-  COMMON_ARGS+=(--weight_view_indices "${WEIGHT_VIEW_INDICES}")
 fi
 if [[ "${RELOCATE}" == "1" ]]; then
   COMMON_ARGS+=(--relocate)
@@ -167,22 +135,11 @@ fi
 if [[ -n "${RELOCATE_OUT}" ]]; then
   COMMON_ARGS+=(--relocate_out "${RELOCATE_OUT}")
 fi
+if [[ -n "${OUT_DIR}" ]]; then
+  COMMON_ARGS+=(--out_dir "${OUT_DIR}")
+fi
 
-IFS=',' read -ra ITER_LIST <<< "${ITERS}"
-
-for it in "${ITER_LIST[@]}"; do
-  it="$(echo "$it" | xargs)"
-  for ((i=0; i<NUM_VIEWS; i++)); do
-    view=$((VIEW_INDEX + i * VIEW_STRIDE))
-    out_dir="${OUT_BASE}/iter_${it}/view_${view}"
-    echo "=== iter=${it}, view=${view} ==="
-    python scripts/estimate_delta_oracle.py \
-      "${COMMON_ARGS[@]}" \
-      --iteration "${it}" \
-      --view_index "${view}" \
-      --out_dir "${out_dir}"
-  done
-done
-
-python scripts/aggregate_delta_oracle.py --base_dir "${OUT_BASE}"
-echo "Summary: ${OUT_BASE}/delta_oracle_sweep_summary.csv"
+python scripts/estimate_delta_oracle.py \
+  "${COMMON_ARGS[@]}" \
+  --iteration "${ITERATION}" \
+  --view_index "${VIEW_INDEX}"
