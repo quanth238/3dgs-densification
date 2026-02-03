@@ -75,16 +75,21 @@ def main():
     ap.add_argument("--base_dir", required=True, type=str)
     ap.add_argument("--out_csv", default="", type=str)
     ap.add_argument("--out_plot", default="", type=str)
+    ap.add_argument("--exclude", default="", type=str,
+                    help="Comma-separated substrings; skip any paths containing them.")
     args = ap.parse_args()
 
     base_dir = args.base_dir
     out_csv = args.out_csv or os.path.join(base_dir, "delta_oracle_sweep_summary.csv")
     out_plot = args.out_plot or os.path.join(base_dir, "delta_oracle_sweep_summary.png")
+    exclude = [s.strip() for s in args.exclude.split(",") if s.strip()]
 
     per_runs = []
     by_k_rows = []
 
     for root, _, files in os.walk(base_dir):
+        if exclude and any(x in root for x in exclude):
+            continue
         if "delta_oracle_summary.csv" not in files:
             continue
         path = os.path.join(root, "delta_oracle_summary.csv")
@@ -104,14 +109,17 @@ def main():
         writer.writerow([
             "iteration","view_index","alpha0","scale_factor","depth_multipliers",
             "depth_source","pcd_coverage","visible_ratio","g_min","g_mean",
-            "tail_tau","tail_frac","num_candidates"
+            "tail_tau","tail_frac","num_candidates",
+            "proposal_mode","w_mode","rc","rf","kc","kf"
         ])
         for r in per_runs:
             writer.writerow([
                 r.get("iteration",""), r.get("view_index",""), r.get("alpha0",""), r.get("scale_factor",""),
                 r.get("depth_multipliers",""), r.get("depth_source",""), r.get("pcd_coverage",""),
                 r.get("visible_ratio",""), r.get("g_min",""), r.get("g_mean",""),
-                r.get("tail_tau",""), r.get("tail_frac",""), r.get("num_candidates","")
+                r.get("tail_tau",""), r.get("tail_frac",""), r.get("num_candidates",""),
+                r.get("proposal_mode",""), r.get("w_mode",""), r.get("rc",""),
+                r.get("rf",""), r.get("kc",""), r.get("kf","")
             ])
 
         f.write("\n# by_iteration\n")

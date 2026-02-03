@@ -8,6 +8,7 @@ import os
 import sys
 import random
 import csv
+import math
 from argparse import ArgumentParser
 from collections import defaultdict
 
@@ -66,6 +67,132 @@ def parse_int_list(s):
             continue
         vals.append(int(p))
     return vals
+
+
+def project_points(view, pts):
+    H = int(view.image_height)
+    W = int(view.image_width)
+    device = pts.device
+    ones = torch.ones((pts.shape[0], 1), device=device, dtype=pts.dtype)
+    pts_hom = torch.cat([pts, ones], dim=1)
+    viewmat = view.world_view_transform
+    projmat = view.full_proj_transform
+    p_view = pts_hom @ viewmat
+    z = p_view[:, 2]
+    p_clip = pts_hom @ projmat
+    ndc = p_clip[:, :3] / (p_clip[:, 3:4] + 1e-8)
+    finite = torch.isfinite(z) & torch.isfinite(ndc).all(dim=1)
+    x = ((ndc[:, 0] + 1.0) * W - 1.0) * 0.5
+    y = ((ndc[:, 1] + 1.0) * H - 1.0) * 0.5
+    valid = finite & (z > 0)
+    xi = x.round().long()
+    yi = y.round().long()
+    valid = valid & (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
+    return xi, yi, valid
+
+
+def compute_gaussian_weights(gaussians, view, err_map, w_mode):
+    xyz = gaussians.get_xyz.detach()
+    xi, yi, valid = project_points(view, xyz)
+    n = xyz.shape[0]
+    w = torch.zeros((n,), device=xyz.device, dtype=xyz.dtype)
+    if valid.any():
+        if w_mode in ("error", "error_opacity"):
+            err_vals = err_map[yi[valid], xi[valid]]
+            w[valid] = err_vals
+        elif w_mode == "opacity":
+            op = torch.sigmoid(gaussians._opacity.detach()).squeeze(-1)
+            w[valid] = op[valid]
+        elif w_mode == "uniform":
+            w[valid] = 1.0
+        else:
+            # default to error
+            err_vals = err_map[yi[valid], xi[valid]]
+            w[valid] = err_vals
+        if w_mode == "error_opacity":
+            op = torch.sigmoid(gaussians._opacity.detach()).squeeze(-1)
+            w[valid] = w[valid] * op[valid]
+    if torch.sum(w) <= 0:
+        # Fallback: uniform over valid (or all if none valid).
+        if valid.any():
+            w[valid] = 1.0
+        else:
+            w.fill_(1.0)
+    return w
+
+
+def compute_gaussian_weights_multi(gaussians, views, err_maps, w_mode):
+    xyz = gaussians.get_xyz.detach()
+    n = xyz.shape[0]
+    device = xyz.device
+    w = torch.zeros((n,), device=device, dtype=xyz.dtype)
+    counts = torch.zeros((n,), device=device, dtype=xyz.dtype)
+    op = torch.sigmoid(gaussians._opacity.detach()).squeeze(-1)
+
+    for view, err_map in zip(views, err_maps):
+        xi, yi, valid = project_points(view, xyz)
+        if not valid.any():
+            continue
+        if w_mode in ("error", "error_opacity"):
+            err_vals = err_map[yi[valid], xi[valid]]
+            w[valid] += err_vals
+        elif w_mode == "uniform":
+            w[valid] += 1.0
+        elif w_mode == "opacity":
+            w[valid] += 1.0
+        else:
+            err_vals = err_map[yi[valid], xi[valid]]
+            w[valid] += err_vals
+        counts[valid] += 1.0
+
+    if w_mode in ("error", "error_opacity"):
+        mask = counts > 0
+        w[mask] = w[mask] / counts[mask]
+    elif w_mode == "opacity":
+        w = op.clone()
+        w[counts == 0] = 0.0
+    elif w_mode == "uniform":
+        w = (counts > 0).float()
+
+    if w_mode == "error_opacity":
+        w = w * op
+
+    if torch.sum(w) <= 0:
+        if counts.sum() > 0:
+            w = (counts > 0).float()
+        else:
+            w.fill_(1.0)
+    return w
+
+
+def sample_candidates_from_gaussians(gaussians, parent_idx, radius, scale_factor):
+    if parent_idx.numel() == 0:
+        return None
+    device = gaussians.get_xyz.device
+    parent_xyz = gaussians._xyz.detach()[parent_idx]
+    parent_scaling = gaussians._scaling.detach()[parent_idx]
+    parent_rotation = gaussians._rotation.detach()[parent_idx]
+    parent_dc = gaussians._features_dc.detach()[parent_idx]
+    parent_rest = gaussians._features_rest.detach()[parent_idx]
+
+    scale = torch.exp(parent_scaling)
+    z = torch.randn_like(scale)
+    offset = z * scale * float(radius)
+    cand_xyz = parent_xyz + offset
+
+    if scale_factor is None:
+        scale_factor = 1.0
+    scale_factor = max(float(scale_factor), 1e-6)
+    cand_scaling = parent_scaling + math.log(scale_factor)
+
+    cand = {
+        "xyz": cand_xyz,
+        "features_dc": parent_dc,
+        "features_rest": parent_rest,
+        "scaling": cand_scaling,
+        "rotation": parent_rotation,
+    }
+    return cand
 
 
 def pixel_to_world(view, px, py, depth, fx, fy, cx, cy):
@@ -156,6 +283,15 @@ def main():
     parser.add_argument("--k_list", default="50,100,200,400", type=str)
     parser.add_argument("--num_trials", default=20, type=int)
     parser.add_argument("--tau", default=0.0, type=float)
+    parser.add_argument("--weight_num_views", default=1, type=int)
+    parser.add_argument("--weight_view_stride", default=1, type=int)
+    parser.add_argument("--weight_view_indices", default="", type=str)
+    parser.add_argument("--proposal_mode", default="pixel_depth", choices=["pixel_depth", "gaussian_perturb"])
+    parser.add_argument("--w_mode", default="error", choices=["error", "opacity", "error_opacity", "uniform"])
+    parser.add_argument("--kc", default=400, type=int)
+    parser.add_argument("--kf", default=400, type=int)
+    parser.add_argument("--rc", default=2.0, type=float)
+    parser.add_argument("--rf", default=0.5, type=float)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--out_dir", default="", type=str)
     parser.add_argument("--no_plot", action="store_true")
@@ -225,94 +361,180 @@ def main():
         invdepth = view.invdepthmap.detach().clone()
         depth_source = "dataset_invdepth"
 
-    depth = torch.zeros_like(invdepth)
-    inv_mask = invdepth > 1e-6
-    depth[inv_mask] = 1.0 / (invdepth[inv_mask] + 1e-8)
-
-    # Error map for candidate selection.
+    # Error map for candidate selection / weighting (base view).
     err = torch.mean(torch.abs(image - gt_image), dim=0)
     if view.alpha_mask is not None:
         err = err * view.alpha_mask[0].cuda()
 
-    valid = inv_mask & (depth > args.depth_min) & (depth < args.depth_max)
-    if valid.ndim == 3:
-        valid = valid[0]
-    if view.alpha_mask is not None:
-        valid = valid & (view.alpha_mask[0].cuda() > 0.5)
+    # Default: use base view only.
+    weight_view_indices = [args.view_index]
+    weight_views = [view]
+    weight_err_maps = [err]
+    # Multi-view weighting only needed for gaussian_perturb.
+    if args.proposal_mode != "pixel_depth":
+        weight_view_indices = parse_int_list(args.weight_view_indices)
+        if not weight_view_indices:
+            weight_view_indices = [args.view_index + i * args.weight_view_stride for i in range(int(args.weight_num_views))]
+        weight_view_indices = [i for i in weight_view_indices if 0 <= i < len(views)]
+        if not weight_view_indices:
+            weight_view_indices = [args.view_index]
 
-    coords = valid.nonzero(as_tuple=False)
-    if coords.numel() == 0:
-        raise RuntimeError("No valid pixels with depth; cannot build candidates.")
-
-    scores = err[valid]
-    topk = min(args.num_pixels, scores.numel())
-    vals, idx = torch.topk(scores, k=topk, largest=True)
-    pix = coords[idx]
-
-    depth_multipliers = parse_float_list(args.depth_multipliers)
-    if not depth_multipliers:
-        depth_multipliers = [1.0]
-
-    fx = fov2focal(view.FoVx, view.image_width)
-    fy = fov2focal(view.FoVy, view.image_height)
-    cx = view.image_width * 0.5
-    cy = view.image_height * 0.5
-
-    cand_xyz = []
-    cand_dc = []
-    cand_depth = []
-    for yx in pix:
-        py = int(yx[0].item())
-        px = int(yx[1].item())
-        d = float(depth[py, px].item())
-        if d <= 0:
-            continue
-        rgb = gt_image[:, py, px].unsqueeze(0)
-        dc = RGB2SH(rgb).squeeze(0)
-        for m in depth_multipliers:
-            dd = d * float(m)
-            if dd <= 0:
+        weight_views = []
+        weight_err_maps = []
+        for idx in weight_view_indices:
+            v = views[idx]
+            if idx == args.view_index:
+                weight_views.append(v)
+                weight_err_maps.append(err)
                 continue
-            p_world = pixel_to_world(view, px, py, dd, fx, fy, cx, cy)
-            cand_xyz.append(p_world)
-            cand_dc.append(dc)
-            cand_depth.append(dd)
+            with torch.no_grad():
+                render_pkg_w = render(v, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp)
+                img_w = render_pkg_w["render"]
+                if v.alpha_mask is not None:
+                    img_w = img_w * v.alpha_mask.cuda()
+                gt_w = v.original_image.cuda()
+                err_w = torch.mean(torch.abs(img_w - gt_w), dim=0)
+                if v.alpha_mask is not None:
+                    err_w = err_w * v.alpha_mask[0].cuda()
+                weight_views.append(v)
+                weight_err_maps.append(err_w)
 
-    if not cand_xyz:
-        raise RuntimeError("No candidates built.")
+    cand_xyz = None
+    cand_features_dc = None
+    cand_features_rest = None
+    cand_scaling = None
+    cand_rotation = None
+    n_cand = 0
 
-    cand_xyz = torch.stack(cand_xyz, dim=0)
-    cand_dc = torch.stack(cand_dc, dim=0)
-    cand_depth = torch.tensor(cand_depth, device="cuda", dtype=torch.float32)
+    if args.proposal_mode == "pixel_depth":
+        depth = torch.zeros_like(invdepth)
+        inv_mask = invdepth > 1e-6
+        depth[inv_mask] = 1.0 / (invdepth[inv_mask] + 1e-8)
 
-    if cand_xyz.shape[0] > args.max_candidates:
-        perm = torch.randperm(cand_xyz.shape[0], device="cuda")[: args.max_candidates]
-        cand_xyz = cand_xyz[perm]
-        cand_dc = cand_dc[perm]
-        cand_depth = cand_depth[perm]
+        valid = inv_mask & (depth > args.depth_min) & (depth < args.depth_max)
+        if valid.ndim == 3:
+            valid = valid[0]
+        if view.alpha_mask is not None:
+            valid = valid & (view.alpha_mask[0].cuda() > 0.5)
 
-    n_cand = cand_xyz.shape[0]
-    cand_features_dc = cand_dc.view(n_cand, 3, 1).transpose(1, 2).contiguous()
-    n_sh = (gaussians.max_sh_degree + 1) ** 2
-    n_rest = n_sh - 1
-    if n_rest > 0:
-        cand_features_rest = torch.zeros((n_cand, n_rest, 3), device="cuda")
+        coords = valid.nonzero(as_tuple=False)
+        if coords.numel() == 0:
+            raise RuntimeError("No valid pixels with depth; cannot build candidates.")
+
+        scores = err[valid]
+        topk = min(args.num_pixels, scores.numel())
+        vals, idx = torch.topk(scores, k=topk, largest=True)
+        pix = coords[idx]
+
+        depth_multipliers = parse_float_list(args.depth_multipliers)
+        if not depth_multipliers:
+            depth_multipliers = [1.0]
+
+        fx = fov2focal(view.FoVx, view.image_width)
+        fy = fov2focal(view.FoVy, view.image_height)
+        cx = view.image_width * 0.5
+        cy = view.image_height * 0.5
+
+        cand_xyz_list = []
+        cand_dc_list = []
+        cand_depth_list = []
+        for yx in pix:
+            py = int(yx[0].item())
+            px = int(yx[1].item())
+            d = float(depth[py, px].item())
+            if d <= 0:
+                continue
+            rgb = gt_image[:, py, px].unsqueeze(0)
+            dc = RGB2SH(rgb).squeeze(0)
+            for m in depth_multipliers:
+                dd = d * float(m)
+                if dd <= 0:
+                    continue
+                p_world = pixel_to_world(view, px, py, dd, fx, fy, cx, cy)
+                cand_xyz_list.append(p_world)
+                cand_dc_list.append(dc)
+                cand_depth_list.append(dd)
+
+        if not cand_xyz_list:
+            raise RuntimeError("No candidates built.")
+
+        cand_xyz = torch.stack(cand_xyz_list, dim=0)
+        cand_dc = torch.stack(cand_dc_list, dim=0)
+        cand_depth = torch.tensor(cand_depth_list, device="cuda", dtype=torch.float32)
+
+        if cand_xyz.shape[0] > args.max_candidates:
+            perm = torch.randperm(cand_xyz.shape[0], device="cuda")[: args.max_candidates]
+            cand_xyz = cand_xyz[perm]
+            cand_dc = cand_dc[perm]
+            cand_depth = cand_depth[perm]
+
+        n_cand = cand_xyz.shape[0]
+        cand_features_dc = cand_dc.view(n_cand, 3, 1).transpose(1, 2).contiguous()
+        n_sh = (gaussians.max_sh_degree + 1) ** 2
+        n_rest = n_sh - 1
+        if n_rest > 0:
+            cand_features_rest = torch.zeros((n_cand, n_rest, 3), device="cuda")
+        else:
+            cand_features_rest = torch.zeros((n_cand, 0, 3), device="cuda")
+
+        base_scale = gaussians.get_scaling.detach()
+        med_scale = torch.median(base_scale, dim=0).values
+        min_scale = med_scale * float(args.scale_min_mult)
+        max_scale = med_scale * float(args.scale_max_mult)
+        cand_sigma_x = cand_depth / fx
+        cand_sigma_y = cand_depth / fy
+        cand_sigma = torch.maximum(cand_sigma_x, cand_sigma_y) * float(args.scale_factor)
+        cand_sigma = torch.clamp(cand_sigma, min=min_scale.min().item(), max=max_scale.max().item())
+        cand_scale = torch.stack([cand_sigma, cand_sigma, cand_sigma], dim=1)
+        cand_scaling = torch.log(cand_scale)
+
+        cand_rotation = torch.zeros((n_cand, 4), device="cuda")
+        cand_rotation[:, 0] = 1.0
     else:
-        cand_features_rest = torch.zeros((n_cand, 0, 3), device="cuda")
+        # Proposal by perturbing existing Gaussians (no depth hypotheses).
+        weight_tag = ",".join(str(i) for i in weight_view_indices)
+        depth_source = f"proposal:{args.proposal_mode}/{args.w_mode}/views={weight_tag}"
+        weights = compute_gaussian_weights_multi(gaussians, weight_views, weight_err_maps, args.w_mode)
+        weights = weights / torch.sum(weights)
 
-    base_scale = gaussians.get_scaling.detach()
-    med_scale = torch.median(base_scale, dim=0).values
-    min_scale = med_scale * float(args.scale_min_mult)
-    max_scale = med_scale * float(args.scale_max_mult)
-    cand_sigma_x = cand_depth / fx
-    cand_sigma_y = cand_depth / fy
-    cand_sigma = torch.maximum(cand_sigma_x, cand_sigma_y) * float(args.scale_factor)
-    cand_sigma = torch.clamp(cand_sigma, min=min_scale.min().item(), max=max_scale.max().item())
-    cand_scale = torch.stack([cand_sigma, cand_sigma, cand_sigma], dim=1)
-    cand_scaling = torch.log(cand_scale)
+        kc = max(int(args.kc), 0)
+        kf = max(int(args.kf), 0)
+        if kc + kf <= 0:
+            kc = int(args.max_candidates)
+            kf = 0
 
-    cand_rotation = torch.zeros((n_cand, 4), device="cuda")
-    cand_rotation[:, 0] = 1.0
+        parent_idx_c = torch.multinomial(weights, kc, replacement=True) if kc > 0 else torch.empty((0,), device=weights.device, dtype=torch.long)
+        parent_idx_f = torch.multinomial(weights, kf, replacement=True) if kf > 0 else torch.empty((0,), device=weights.device, dtype=torch.long)
+
+        cand_parts = []
+        if kc > 0:
+            cand_parts.append(sample_candidates_from_gaussians(gaussians, parent_idx_c, args.rc, args.scale_factor))
+        if kf > 0:
+            cand_parts.append(sample_candidates_from_gaussians(gaussians, parent_idx_f, args.rf, args.scale_factor))
+
+        cand_xyz_list = []
+        cand_dc_list = []
+        cand_rest_list = []
+        cand_scaling_list = []
+        cand_rotation_list = []
+        for part in cand_parts:
+            if part is None:
+                continue
+            cand_xyz_list.append(part["xyz"])
+            cand_dc_list.append(part["features_dc"])
+            cand_rest_list.append(part["features_rest"])
+            cand_scaling_list.append(part["scaling"])
+            cand_rotation_list.append(part["rotation"])
+
+        if not cand_xyz_list:
+            raise RuntimeError("No candidates built from Gaussian perturbation.")
+
+        cand_xyz = torch.cat(cand_xyz_list, dim=0)
+        cand_features_dc = torch.cat(cand_dc_list, dim=0)
+        cand_features_rest = torch.cat(cand_rest_list, dim=0)
+        cand_scaling = torch.cat(cand_scaling_list, dim=0)
+        cand_rotation = torch.cat(cand_rotation_list, dim=0)
+        n_cand = cand_xyz.shape[0]
 
     alpha0 = float(args.alpha0)
     alpha0 = min(max(alpha0, 1e-6), 1.0 - 1e-6)
@@ -411,12 +633,14 @@ def main():
         writer = csv.writer(f)
         writer.writerow([
             "iteration","view_index","alpha0","scale_factor","depth_multipliers","depth_source",
-            "pcd_coverage","visible_ratio","g_min","g_mean","tail_tau","tail_frac","num_candidates"
+            "pcd_coverage","visible_ratio","g_min","g_mean","tail_tau","tail_frac","num_candidates",
+            "proposal_mode","w_mode","rc","rf","kc","kf"
         ])
         pcd_ratio = float((invdepth_pcd > 0).float().mean().item()) if invdepth_pcd is not None else float("nan")
         writer.writerow([
             args.iteration, args.view_index, alpha0, args.scale_factor, args.depth_multipliers, depth_source,
-            pcd_ratio, visible_ratio, g_min, g_mean, args.tau, tail_frac, n_cand
+            pcd_ratio, visible_ratio, g_min, g_mean, args.tau, tail_frac, n_cand,
+            args.proposal_mode, args.w_mode, args.rc, args.rf, args.kc, args.kf
         ])
 
         f.write("\n# by_K\n")

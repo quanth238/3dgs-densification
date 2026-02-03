@@ -13,6 +13,9 @@ Usage:
     --alpha0 1e-2 --scale_factor 3.0 \
     --depth_multipliers "0.5,0.7,0.9,1.0" \
     --k_list "50,100,200,400" \
+    [--proposal_mode gaussian_perturb] [--w_mode opacity] \
+    [--rc 3.0 --rf 0.25 --kc 200 --kf 400] \
+    [--weight_num_views 1 --weight_view_stride 1 --weight_view_indices ""] \
     --use_pcd_depth --pcd_fallback_render
 
 Outputs:
@@ -35,6 +38,15 @@ SCALE_FACTOR="3.0"
 DEPTH_MULTS="0.5,0.7,0.9,1.0"
 K_LIST="50,100,200,400"
 NUM_TRIALS="20"
+PROPOSAL_MODE=""
+W_MODE=""
+RC=""
+RF=""
+KC=""
+KF=""
+WEIGHT_NUM_VIEWS=""
+WEIGHT_VIEW_STRIDE=""
+WEIGHT_VIEW_INDICES=""
 USE_DATASET_DEPTH="0"
 USE_PCD_DEPTH="0"
 PCD_FALLBACK="0"
@@ -55,6 +67,15 @@ while [[ $# -gt 0 ]]; do
     --depth_multipliers) DEPTH_MULTS="$2"; shift 2;;
     --k_list) K_LIST="$2"; shift 2;;
     --num_trials) NUM_TRIALS="$2"; shift 2;;
+    --proposal_mode) PROPOSAL_MODE="$2"; shift 2;;
+    --w_mode) W_MODE="$2"; shift 2;;
+    --rc) RC="$2"; shift 2;;
+    --rf) RF="$2"; shift 2;;
+    --kc) KC="$2"; shift 2;;
+    --kf) KF="$2"; shift 2;;
+    --weight_num_views) WEIGHT_NUM_VIEWS="$2"; shift 2;;
+    --weight_view_stride) WEIGHT_VIEW_STRIDE="$2"; shift 2;;
+    --weight_view_indices) WEIGHT_VIEW_INDICES="$2"; shift 2;;
     --use_dataset_depth) USE_DATASET_DEPTH="1"; shift 1;;
     --use_pcd_depth) USE_PCD_DEPTH="1"; shift 1;;
     --pcd_fallback_render) PCD_FALLBACK="1"; shift 1;;
@@ -87,6 +108,33 @@ if [[ "${USE_PCD_DEPTH}" == "1" ]]; then
 fi
 if [[ "${PCD_FALLBACK}" == "1" ]]; then
   COMMON_ARGS+=(--pcd_fallback_render)
+fi
+if [[ -n "${PROPOSAL_MODE}" ]]; then
+  COMMON_ARGS+=(--proposal_mode "${PROPOSAL_MODE}")
+fi
+if [[ -n "${W_MODE}" ]]; then
+  COMMON_ARGS+=(--w_mode "${W_MODE}")
+fi
+if [[ -n "${RC}" ]]; then
+  COMMON_ARGS+=(--rc "${RC}")
+fi
+if [[ -n "${RF}" ]]; then
+  COMMON_ARGS+=(--rf "${RF}")
+fi
+if [[ -n "${KC}" ]]; then
+  COMMON_ARGS+=(--kc "${KC}")
+fi
+if [[ -n "${KF}" ]]; then
+  COMMON_ARGS+=(--kf "${KF}")
+fi
+if [[ -n "${WEIGHT_NUM_VIEWS}" ]]; then
+  COMMON_ARGS+=(--weight_num_views "${WEIGHT_NUM_VIEWS}")
+fi
+if [[ -n "${WEIGHT_VIEW_STRIDE}" ]]; then
+  COMMON_ARGS+=(--weight_view_stride "${WEIGHT_VIEW_STRIDE}")
+fi
+if [[ -n "${WEIGHT_VIEW_INDICES}" ]]; then
+  COMMON_ARGS+=(--weight_view_indices "${WEIGHT_VIEW_INDICES}")
 fi
 
 IFS=',' read -ra ITER_LIST <<< "${ITERS}"
