@@ -56,14 +56,23 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        source_path = args.source_path
+        if not os.path.exists(os.path.join(source_path, "sparse")) and not os.path.exists(
+            os.path.join(source_path, "transforms_train.json")
+        ):
+            alt_colmap = os.path.join(source_path, "colmap")
+            if os.path.exists(os.path.join(alt_colmap, "sparse")):
+                print(f"[ConeGS] source_path has no 'sparse', using {alt_colmap} instead.")
+                source_path = alt_colmap
+
+        if os.path.exists(os.path.join(source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](
-                args.source_path, args.images, args.eval, n_views=args.n_views
+                source_path, args.images, args.eval, n_views=args.n_views
             )
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        elif os.path.exists(os.path.join(source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](
-                args.source_path, args.white_background, args.eval
+                source_path, args.white_background, args.eval
             )
         else:
             assert False, "Could not recognize scene type!"

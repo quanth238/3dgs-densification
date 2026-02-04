@@ -62,6 +62,10 @@ if [[ ! -d "$CONEGS_DIR" ]]; then
   exit 1
 fi
 
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES=3
+fi
+
 pushd "$CONEGS_DIR" >/dev/null
 python train.py --config-name defaults.yaml \
   gaussian_model.source_path="$SOURCE_PATH" \

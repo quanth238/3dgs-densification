@@ -10,12 +10,14 @@ import random
 import csv
 import math
 import json
+import shutil
 from argparse import ArgumentParser
 from collections import defaultdict
 
 import numpy as np
 import torch
 from torch import nn
+from plyfile import PlyData
 
 # Ensure repo root is on sys.path when running as a script.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -653,6 +655,12 @@ def main():
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     optim = OptimizationParams(parser)
+    def add_arg_if_missing(*args, **kwargs):
+        # Avoid argparse conflicts when ParamGroup already registered an option.
+        for opt in args:
+            if opt in parser._option_string_actions:
+                return
+        parser.add_argument(*args, **kwargs)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--split", default="train", choices=["train", "test"])
     parser.add_argument("--view_index", default=0, type=int)
@@ -693,12 +701,12 @@ def main():
     parser.add_argument("--kf", default=400, type=int)
     parser.add_argument("--rc", default=2.0, type=float)
     parser.add_argument("--rf", default=0.5, type=float)
-    parser.add_argument("--triang_view_indices", default="", type=str, help="Comma list of secondary views for triangulation.")
-    parser.add_argument("--triang_downscale", default=1, type=int, help="Downscale factor for epipolar matching.")
-    parser.add_argument("--triang_patch", default=3, type=int, help="Patch radius for NCC matching.")
-    parser.add_argument("--triang_max_samples", default=64, type=int, help="Samples along epipolar line.")
-    parser.add_argument("--triang_min_ncc", default=0.6, type=float, help="Minimum NCC to accept match.")
-    parser.add_argument("--triang_max_ray_dist", default=0.0, type=float, help="Max ray-ray distance for triangulation (0=auto).")
+    add_arg_if_missing("--triang_view_indices", default="", type=str, help="Comma list of secondary views for triangulation.")
+    add_arg_if_missing("--triang_downscale", default=1, type=int, help="Downscale factor for epipolar matching.")
+    add_arg_if_missing("--triang_patch", default=3, type=int, help="Patch radius for NCC matching.")
+    add_arg_if_missing("--triang_max_samples", default=64, type=int, help="Samples along epipolar line.")
+    add_arg_if_missing("--triang_min_ncc", default=0.6, type=float, help="Minimum NCC to accept match.")
+    add_arg_if_missing("--triang_max_ray_dist", default=0.0, type=float, help="Max ray-ray distance for triangulation (0=auto).")
     parser.add_argument("--refine_steps", default=0, type=int, help="Number of candidate refinement steps (0 disables).")
     parser.add_argument("--refine_lr", default=0.0, type=float, help="Learning rate for candidate refinement.")
     parser.add_argument("--refine_params", default="xyz", type=str, help="Comma list: xyz,scaling,rotation")
@@ -712,15 +720,59 @@ def main():
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--out_dir", default="", type=str)
     parser.add_argument("--no_plot", action="store_true")
+    parser.add_argument("--no_cfg", action="store_true", help="Ignore model_path/cfg_args and use CLI args only.")
+    parser.add_argument("--ply_path", default="", type=str, help="Optional explicit path to point_cloud.ply to load.")
 
     args_cmdline = parser.parse_args()
     cfg_args_path = ""
     if getattr(args_cmdline, "model_path", None):
         cfg_args_path = os.path.join(args_cmdline.model_path, "cfg_args")
-    if cfg_args_path and os.path.exists(cfg_args_path):
+    if cfg_args_path and os.path.exists(cfg_args_path) and not args_cmdline.no_cfg:
         args = get_combined_args(parser)
     else:
         args = args_cmdline
+    if getattr(args, "depths", None) is None:
+        args.depths = ""
+    if getattr(args, "resolution", None) is None:
+        args.resolution = -1
+    if getattr(args, "data_device", None) is None:
+        args.data_device = "cuda"
+    if getattr(args, "sh_degree", None) is None:
+        args.sh_degree = 3
+    if getattr(args, "ply_path", None) is None:
+        args.ply_path = ""
+
+    if args.ply_path:
+        ply_path = os.path.abspath(args.ply_path)
+        if not os.path.isfile(ply_path):
+            raise FileNotFoundError(f"PLY file not found: {ply_path}")
+        # Infer SH degree from PLY if available.
+        try:
+            plydata = PlyData.read(ply_path)
+            extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+            if extra_f_names:
+                n_extra = len(extra_f_names)
+                if n_extra % 3 == 0:
+                    v = n_extra // 3 + 1
+                    deg = int(round(math.sqrt(v) - 1))
+                    if (deg + 1) ** 2 == v:
+                        args.sh_degree = deg
+        except Exception:
+            pass
+        # Create a temporary model path with the expected structure so Scene can load it.
+        out_dir = args.out_dir or args.model_path or "."
+        tmp_model = os.path.join(out_dir, "_tmp_model_ply")
+        iter_tag = str(args.iteration if args.iteration is not None else -1)
+        target_dir = os.path.join(tmp_model, "point_cloud", f"iteration_{iter_tag}")
+        os.makedirs(target_dir, exist_ok=True)
+        target_ply = os.path.join(target_dir, "point_cloud.ply")
+        try:
+            if os.path.lexists(target_ply):
+                os.remove(target_ply)
+            os.symlink(ply_path, target_ply)
+        except Exception:
+            shutil.copyfile(ply_path, target_ply)
+        args.model_path = tmp_model
 
     # Normalize aliases for responsibility-based weighting.
     if args.w_mode == "responsibility":
