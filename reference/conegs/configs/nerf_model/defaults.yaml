@@ -28,6 +28,7 @@ sampling_type: "lindisp"
 pretrain_with_gaussians: false
 use_adaptive_scaling: false
 cumsum_jiggle: false
+cumsum_quantiles: ""
 stack_images: true
 log_nerf_renders: false
 nerf_train_during_3dgs: false

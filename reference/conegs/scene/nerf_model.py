@@ -473,43 +473,56 @@ class NeRFModel:
         color_samples=None,
     ):
         trans = inclusive_prod((1 - opacities.squeeze(-1)))
-        if cumsum_jiggle:
-            cumsum_opacity_threshold = torch.rand(len(trans), 1, device=trans.device) * 0.48 + 0.02
-        reaches_threshold = trans < cumsum_opacity_threshold
-        indexes = torch.argmax(reaches_threshold.int(), dim=1)
-        opacity_mask = opacities[torch.arange(len(indexes)), indexes] > min_opacity
-        indexes = indexes[opacity_mask]
+        # Support multiple quantiles for multi-depth proposals.
+        if isinstance(cumsum_opacity_threshold, (list, tuple)):
+            thresholds = torch.tensor(cumsum_opacity_threshold, device=trans.device, dtype=trans.dtype)
+        elif torch.is_tensor(cumsum_opacity_threshold) and cumsum_opacity_threshold.ndim >= 1:
+            thresholds = cumsum_opacity_threshold.to(device=trans.device, dtype=trans.dtype)
+        else:
+            thresholds = torch.tensor([cumsum_opacity_threshold], device=trans.device, dtype=trans.dtype)
 
-        xyz = xyz[opacity_mask][torch.arange(len(indexes)), indexes]
+        if cumsum_jiggle:
+            thresholds = torch.rand((len(trans), thresholds.numel()), device=trans.device, dtype=trans.dtype) * 0.48 + 0.02
+        else:
+            thresholds = thresholds.view(1, -1).repeat(len(trans), 1)
+
+        reaches_threshold = trans.unsqueeze(1) < thresholds.unsqueeze(-1)
+        indexes = torch.argmax(reaches_threshold.int(), dim=-1)  # [num_rays, num_thresh]
+
+        flat_rays = torch.arange(len(trans), device=trans.device).unsqueeze(1).repeat(1, indexes.shape[1]).reshape(-1)
+        flat_idx = indexes.reshape(-1)
+        opacity_mask = opacities[flat_rays, flat_idx] > min_opacity
+        flat_rays = flat_rays[opacity_mask]
+        flat_idx = flat_idx[opacity_mask]
+
+        xyz = xyz[flat_rays, flat_idx]
         xyz = nerf2gs_point_transform(xyz, scene.gs2nerf_scale, scene.inv_gs2nerf_T)
 
         if features_dc is not None and features_rest is not None:
-            features_dc = features_dc[opacity_mask].reshape(len(indexes), -1, 1, 3)[
-                torch.arange(len(indexes)), indexes
-            ]
-            features_rest = features_rest[opacity_mask].reshape(
-                len(indexes), -1, gaussians.features_rest_len // 3, 3
-            )[torch.arange(len(indexes)), indexes]
+            features_dc = features_dc.reshape(len(trans), -1, 1, 3)[flat_rays, flat_idx]
+            features_rest = features_rest.reshape(
+                len(trans), -1, gaussians.features_rest_len // 3, 3
+            )[flat_rays, flat_idx]
         else:
             if color_samples is not None:
-                color = color_samples[opacity_mask][torch.arange(len(indexes)), indexes]
+                color = color_samples[flat_rays, flat_idx]
             else:
-                color = color[opacity_mask]
+                color = color[flat_rays]
             
             features_dc = RGB2SH(color).reshape(-1, 1, 3)
             # features_dc = RGB2SH(color[opacity_mask]).reshape(-1, 1, 3)
-            features_rest = torch.zeros(len(indexes), gaussians.features_rest_len // 3, 3).cuda()
+            features_rest = torch.zeros(len(flat_idx), gaussians.features_rest_len // 3, 3).cuda()
         stds = (
-            pixel_width_mult.squeeze(1)[opacity_mask]
-            * tdist[opacity_mask][torch.arange(len(indexes)), indexes]
-            / unnormalized_directions[opacity_mask].norm(dim=1, keepdim=True)
+            pixel_width_mult.squeeze(1)[flat_rays]
+            * tdist[flat_rays, flat_idx]
+            / unnormalized_directions[flat_rays].norm(dim=1, keepdim=True)
             / scene.gs2nerf_scale
         )
         scaling = stds.repeat(1, 3)
-        rotation = torch.zeros(len(indexes), 4).cuda()
+        rotation = torch.zeros(len(flat_idx), 4).cuda()
         rotation[:, 0] = 1
         opacity = inverse_sigmoid(
-            0.1 * torch.ones((len(indexes), 1), dtype=torch.float, device="cuda")
+            0.1 * torch.ones((len(flat_idx), 1), dtype=torch.float, device="cuda")
         )
         if xyz_depth is not None:
             xyz = xyz_depth
@@ -520,7 +533,7 @@ class NeRFModel:
             opacity,
             gaussians.scaling_inverse_activation(scaling * scaling_mult),
             rotation,
-            weights[opacity_mask],
+            weights[flat_rays],
         )
         return xyz
 
@@ -597,6 +610,17 @@ class NeRFModel:
                 )
             else:
                 features_dc, features_rest = None, None
+            cumsum_quantiles = getattr(self.nerf_cfg, "cumsum_quantiles", "")
+            if isinstance(cumsum_quantiles, str):
+                cumsum_quantiles = [q.strip() for q in cumsum_quantiles.split(",") if q.strip()]
+                cumsum_quantiles = [float(q) for q in cumsum_quantiles] if cumsum_quantiles else []
+            elif isinstance(cumsum_quantiles, (list, tuple)):
+                cumsum_quantiles = [float(q) for q in cumsum_quantiles]
+            else:
+                cumsum_quantiles = []
+            if not cumsum_quantiles:
+                cumsum_quantiles = [0.5]
+
             xyz = self.select_for_densification(
                 gaussians,
                 scene,
@@ -610,6 +634,7 @@ class NeRFModel:
                 params["unnormalized_directions"],
                 scaling_mult=scaling_mult,
                 cumsum_jiggle=self.nerf_cfg.cumsum_jiggle,
+                cumsum_opacity_threshold=cumsum_quantiles,
                 features_dc=features_dc,
                 features_rest=features_rest,
                 densities=render_pkg["sigmas"],
